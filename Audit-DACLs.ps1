@@ -1,38 +1,43 @@
-<#
-.SYNOPSIS
-    Audits Active Directory object DACLs for specific dangerous permissions held by controlled principals.
-.DESCRIPTION
-    This script connects to a specified Domain Controller and retrieves the discretionary access control list (DACL)
-    of a target object. It checks if any provided controlled principals possess critical or dangerous rights 
-    (e.g., GenericAll, WriteDacl, WriteOwner, DCSync, or RBCD modifications) over that object.
-.PARAMETER Domain
-    The target domain name (e.g., corp.local).
-.PARAMETER DomainController
-    The IP address or hostname of the Domain Controller to query.
-.PARAMETER TargetDN
-    The Distinguished Name of the target object to inspect. Accepts pipeline input.
-.PARAMETER ControlledPrincipals
-    An array of SamAccountNames, SIDs, or Display Names representing the principals you control or want to check.
-.EXAMPLE
-    Get-Content .\targets.txt | .\Find-DangerousACE.ps1 -Domain "INLANEFREIGHT.LOCAL" -DomainController "10.129.202.146" -ControlledPrincipals "lowuser", "Domain Users"
-#>
-
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, HelpMessage = "Domain name is required.")]
+    [Parameter(Mandatory = $true, ParameterSetName = "Default", HelpMessage = "Domain name is required.")]
     [string]$Domain,
 
-    [Parameter(Mandatory = $true, HelpMessage = "Domain Controller IP or Hostname is required.")]
+    [Parameter(Mandatory = $true, ParameterSetName = "Default", HelpMessage = "Domain Controller IP or Hostname is required.")]
     [string]$DomainController,
 
-    [Parameter(Mandatory = $true, ValueFromPipeline = $true, HelpMessage = "Target Distinguished Name (DN) is required.")]
+    [Parameter(Mandatory = $true, ValueFromPipeline = $true, ParameterSetName = "Default", HelpMessage = "Target Distinguished Name (DN) is required.")]
     [string]$TargetDN,
 
-    [Parameter(Mandatory = $true, HelpMessage = "List of controlled principals to check.")]
-    [string[]]$ControlledPrincipals
+    [Parameter(Mandatory = $true, ParameterSetName = "Default", HelpMessage = "List of controlled principals to check.")]
+    [string[]]$ControlledPrincipals,
+
+    [Parameter(Mandatory = $true, ParameterSetName = "Help")]
+    [Alias("h")]
+    [switch]$Help
 )
 
 begin {
+    # Custom interactive help menu
+    if ($PSCmdlet.ParameterSetName -eq "Help" -or $Help) {
+        Write-Host "`n--------------------------------------------------------------------------" -ForegroundColor Cyan
+        Write-Host "  Active Directory DACL Auditor (PowerShell Edition)" -ForegroundColor White
+        Write-Host "--------------------------------------------------------------------------" -ForegroundColor Cyan
+        Write-Host "Usage:" -ForegroundColor Yellow
+        Write-Host "  Standard execution:" -ForegroundColor White
+        Write-Host "    .\Audit-DACLs.ps1 -Domain 'domain.local' -DomainController '10.10.10.10' -TargetDN 'CN=Target...' -ControlledPrincipals 'lowuser', 'Domain Users'" -ForegroundColor Gray
+        Write-Host "`n  Pipeline execution (Multiple TargetDNs from text file/output):" -ForegroundColor White
+        Write-Host "    Get-Content .\DNs.txt | .\Audit-DACLs.ps1 -Domain 'domain.local' -DomainController '10.10.10.10' -ControlledPrincipals 'Domain Users', 'lowuser'" -ForegroundColor Gray
+        Write-Host "`nParameters:" -ForegroundColor Yellow
+        Write-Host "  -Domain              Target AD domain FQDN (e.g., corp.local)" -ForegroundColor White
+        Write-Host "  -DomainController    IP address or hostname of the Domain Controller" -ForegroundColor White
+        Write-Host "  -TargetDN            Distinguished Name (DN) of the AD object to audit" -ForegroundColor White
+        Write-Host "  -ControlledPrincipals  Array of SamAccountNames, SIDs, or display names to map" -ForegroundColor White
+        Write-Host "  -Help, -h            Show this help message" -ForegroundColor White
+        Write-Host "--------------------------------------------------------------------------" -ForegroundColor Cyan
+        exit
+    }
+
     # 1. Base Active Directory Rights (Bitmask checks)
     $DangerousBaseRights = @(
         "GenericAll",        # Full control over the object
@@ -42,17 +47,22 @@ begin {
         "WriteProperty",      # Ability to modify object attributes (e.g., scriptPath, servicePrincipalName)
         "ExtendedRight",      # Required for specific tasks like Reset Password or ForceChangePassword
         "CreateChild",        # Dangerous if target is an OU (e.g., creating a malicious computer/user object)
+        "DeleteChild",        # Can bypass protections by dropping structural objects
+        "Delete",             # Direct object deletion capabilities
         "Self"                # Self-membership write actions
     )
 
     # 2. Specific Extended Rights GUIDs / Known Names
-    # These often map to "ExtendedRight" but represent the actual dangerous actions
+    # These map to "ExtendedRight" but represent the actual dangerous actions
     $DangerousExtendedRights = @{
         "002a969f-2652-11d1-bf8d-0000f8757935" = "DS-Replication-Get-Changes (DCSync part 1)"
         "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" = "DS-Replication-Get-Changes-All (DCSync part 2)"
         "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" = "DS-Replication-Get-Changes-In-Filtered-Set"
         "00000000-0000-0000-0000-000000000000" = "All Extended Rights"
         "002a96a0-2652-11d1-bf8d-0000f8757935" = "User-Force-Change-Password"
+        "992a96a4-2652-11d1-bf8d-0000f8757935" = "Add-Guid (Add member to group via validated write)"
+        "0e10c968-78fb-11d2-90d4-00c04f79dc55" = "Certificate-Enrollment (ADCS Template ESC1/ESC2)"
+        "a05b8cc2-178a-11d2-b8df-00c04fa378c1" = "Certificate-AutoEnrollment (ADCS Template Takeover)"
     }
 
     # 3. Critical Properties / Attributes GUIDs
@@ -63,6 +73,11 @@ begin {
         "a05b03d2-8790-11d1-9243-00c04f79dec0" = "msDS-AllowedToDelegateTo (Constrained Delegation)"
         "3b9087b3-0d56-44b2-8412-2ca447bcc21f" = "msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD)"
         "5f202011-e3a1-11d1-90c8-00c04fd91a17" = "scriptPath (Logon Script Modification)"
+        "f3a647c9-011e-11d1-a93b-00a0c90f57b7" = "userAccountControl (Malicious Delegation/Pre-Auth Flags)"
+        "3e0abfd0-126a-11d0-a0c2-00aa006c33ed" = "gPCFileSysPath (GPO Underlying File Paths Modification)"
+        "f3a647cc-011e-11d1-a93b-00a0c90f57b7" = "gPLink (GPO Link Overlay Execution)"
+        "46a9b11d-23e7-44bc-a1a9-21b78d21097a" = "ms-MCS-AdmPwd (Legacy LAPS Password Read)"
+        "adc338f0-3134-4bc6-a0f5-3c120d0f2849" = "ms-LAPS-Password (Modern LAPS Password Read)"
     }
 
     Write-Verbose "Database containing expanded dangerous rights initialized successfully."
